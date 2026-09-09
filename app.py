@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -9,11 +8,11 @@ from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
 
 BASE_DIR = Path(__file__).resolve().parent
-WORK_DIR = BASE_DIR / 'work'
-WORK_DIR.mkdir(exist_ok=True)
+WORK_DIR = Path(os.environ.get('WORK_DIR', BASE_DIR / 'work'))
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'webm', 'mp4'}
 
@@ -46,10 +45,9 @@ def process_audio():
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     input_path = job_dir / secure_filename(uploaded.filename)
-    output_path = job_dir / 'lecture_cleaned.wav'
+    output_path = job_dir / 'lecture_cleaned.mp3'
 
     try:
-        # save() streams the multipart body to disk instead of holding the entire recording in RAM
         uploaded.save(input_path)
 
         level = request.form.get('level', 'medium')
@@ -60,8 +58,6 @@ def process_audio():
         }
         highpass_hz, comp_ratio, denoise = settings.get(level, settings['medium'])
 
-        # Designed for lecture recordings: cut desk/pen thumps, reduce steady noise,
-        # compress speech dynamics, then normalize overall loudness.
         filters = (
             f'highpass=f={highpass_hz}:p=2,'
             f'afftdn=nr={denoise}:nf=-40,'
@@ -74,8 +70,8 @@ def process_audio():
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
             '-i', str(input_path),
             '-vn', '-af', filters,
-            '-ar', '48000', '-ac', '2',
-            '-c:a', 'pcm_s16le', str(output_path)
+            '-ar', '44100', '-ac', '1',
+            '-c:a', 'libmp3lame', '-b:a', '128k', str(output_path)
         ]
         completed = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60 * 6)
         if completed.returncode != 0 or not output_path.exists():
@@ -85,14 +81,13 @@ def process_audio():
         return jsonify(
             ok=True,
             download_url=f'/api/download/{job_id}',
-            filename='lecture_cleaned.wav'
+            filename='lecture_cleaned.mp3'
         )
     except subprocess.TimeoutExpired:
         return jsonify(error='처리 시간이 너무 오래 걸려 중단되었습니다.'), 504
     except Exception as exc:
         return jsonify(error=f'처리 중 오류가 발생했습니다: {exc}'), 500
     finally:
-        # Keep output for download; remove only the original after successful processing.
         if output_path.exists() and input_path.exists():
             try:
                 input_path.unlink()
@@ -104,15 +99,15 @@ def process_audio():
 def download(job_id):
     if '/' in job_id or '\\' in job_id or not job_id.isalnum():
         return jsonify(error='잘못된 요청입니다.'), 400
-    output_path = WORK_DIR / job_id / 'lecture_cleaned.wav'
+    output_path = WORK_DIR / job_id / 'lecture_cleaned.mp3'
     if not output_path.exists():
         return jsonify(error='처리된 파일을 찾을 수 없습니다.'), 404
-    return send_file(output_path, as_attachment=True, download_name='lecture_cleaned.wav')
+    return send_file(output_path, as_attachment=True, download_name='lecture_cleaned.mp3')
 
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error='파일이 너무 큽니다. 최대 2GB까지 지원합니다.'), 413
+    return jsonify(error='파일이 너무 큽니다. 최대 100MB까지 지원합니다.'), 413
 
 
 if __name__ == '__main__':

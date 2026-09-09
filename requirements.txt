@@ -1,3 +1,4 @@
 Flask>=3.1,<4
 Werkzeug>=3.1,<4
 gunicorn>=23,<24
+imageio-ffmpeg>=0.6,<1

@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: lecture-audio-cleaner
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /

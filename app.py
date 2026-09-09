@@ -4,6 +4,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+import imageio_ffmpeg
 from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
@@ -21,8 +22,9 @@ def allowed(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def ffmpeg_exists():
-    return shutil.which('ffmpeg') is not None
+def ffmpeg_path():
+    path = shutil.which('ffmpeg')
+    return path or imageio_ffmpeg.get_ffmpeg_exe()
 
 
 @app.get('/')
@@ -32,8 +34,10 @@ def index():
 
 @app.post('/api/process')
 def process_audio():
-    if not ffmpeg_exists():
-        return jsonify(error='FFmpeg가 서버에 설치되어 있지 않습니다.'), 500
+    try:
+        ffmpeg = ffmpeg_path()
+    except Exception as exc:
+        return jsonify(error=f'FFmpeg를 준비하지 못했습니다: {exc}'), 500
 
     uploaded = request.files.get('audio')
     if not uploaded or not uploaded.filename:
@@ -67,7 +71,7 @@ def process_audio():
         )
 
         cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
             '-i', str(input_path),
             '-vn', '-af', filters,
             '-ar', '44100', '-ac', '1',

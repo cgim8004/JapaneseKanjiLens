@@ -100,6 +100,7 @@ def process_job(job_id, level):
             input_path.unlink()
         except OSError:
             pass
+        shutil.rmtree(job_dir / 'chunks', ignore_errors=True)
         write_status(job_dir, 'done', '복원이 완료되었습니다.')
     except subprocess.TimeoutExpired:
         write_status(job_dir, 'error', error='처리 시간이 너무 오래 걸려 중단되었습니다.')
@@ -108,10 +109,34 @@ def process_job(job_id, level):
 
 
 def start_processing(job_id, level):
-    # Do not detach the worker from Gunicorn. Render can terminate detached
-    # children, which leaves the browser stuck in "processing" forever.
     thread = threading.Thread(target=process_job, args=(job_id, level), daemon=True)
     thread.start()
+
+
+def assemble_chunks(job_dir, filename, expected_size, total):
+    chunks_dir = job_dir / 'chunks'
+    input_path = job_dir / filename
+    temp_path = job_dir / f'{filename}.assembling'
+
+    try:
+        with temp_path.open('wb') as output:
+            for index in range(total):
+                chunk_path = chunks_dir / str(index)
+                if not chunk_path.exists():
+                    return False, f'{index + 1}/{total}번 업로드 조각이 없습니다.'
+                with chunk_path.open('rb') as chunk:
+                    shutil.copyfileobj(chunk, output, length=1024 * 1024)
+
+        if temp_path.stat().st_size != expected_size:
+            return False, f'파일 크기 불일치: {temp_path.stat().st_size} / {expected_size} bytes'
+
+        temp_path.replace(input_path)
+        return True, ''
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
 
 
 @app.get('/')
@@ -136,11 +161,11 @@ def create_job():
     job_id = uuid.uuid4().hex
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / 'chunks').mkdir()
     (job_dir / 'upload.meta').write_text(
         json.dumps({'filename': filename, 'size': size, 'level': level}, ensure_ascii=False),
         encoding='utf-8'
     )
-    (job_dir / filename).touch()
     write_status(job_dir, 'uploading', '파일 업로드 준비 중...')
     return jsonify(ok=True, job_id=job_id)
 
@@ -162,21 +187,24 @@ def upload_chunk(job_id):
         if index < 0 or total <= 0 or index >= total:
             return jsonify(error='잘못된 업로드 조각입니다.'), 400
 
-        input_path = job_dir / meta['filename']
         chunk = request.get_data(cache=False)
         if not chunk:
             return jsonify(error='빈 업로드 조각입니다.'), 400
 
-        with input_path.open('ab') as f:
-            f.write(chunk)
+        chunks_dir = job_dir / 'chunks'
+        chunks_dir.mkdir(exist_ok=True)
+        chunk_path = chunks_dir / str(index)
+        chunk_path.write_bytes(chunk)
 
-        received = input_path.stat().st_size
-        write_status(job_dir, 'uploading', f'파일 업로드 중... {min(100, round(received / meta["size"] * 100))}%')
+        received = sum(p.stat().st_size for p in chunks_dir.iterdir() if p.is_file())
+        percent = min(100, round(received / int(meta['size']) * 100))
+        write_status(job_dir, 'uploading', f'파일 업로드 중... {percent}%')
 
         if index == total - 1:
-            if received != meta['size']:
-                write_status(job_dir, 'error', error='파일 업로드 크기가 일치하지 않습니다.')
-                return jsonify(error='파일 업로드가 완전하지 않습니다.'), 400
+            ok, detail = assemble_chunks(job_dir, meta['filename'], int(meta['size']), total)
+            if not ok:
+                write_status(job_dir, 'error', error=f'파일 업로드가 완전하지 않습니다. {detail}')
+                return jsonify(error=f'파일 업로드가 완전하지 않습니다. {detail}'), 400
 
             level = meta.get('level', 'medium')
             write_status(job_dir, 'queued', '업로드 완료. 음성 복원을 시작합니다.')

@@ -61,26 +61,39 @@ function postJson(url, body) {
 
 function uploadChunk(url, blob, index, total) {
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.setRequestHeader('X-Chunk-Index', String(index));
-    xhr.setRequestHeader('X-Total-Chunks', String(total));
-    xhr.onload = () => {
-      let data = {};
-      try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-      else reject(new Error(data.error || `업로드 오류 (${xhr.status})`));
+    let attempt = 0;
+    const send = () => {
+      attempt++;
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-Chunk-Index', String(index));
+      xhr.setRequestHeader('X-Total-Chunks', String(total));
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+        else if (attempt < 4) setTimeout(send, 1000 * attempt);
+        else reject(new Error(data.error || `업로드 오류 (${xhr.status})`));
+      };
+      xhr.onerror = () => {
+        if (attempt < 4) setTimeout(send, 1000 * attempt);
+        else reject(new Error('서버와 연결이 끊어졌습니다.'));
+      };
+      xhr.ontimeout = () => {
+        if (attempt < 4) setTimeout(send, 1000 * attempt);
+        else reject(new Error('업로드 시간이 초과되었습니다.'));
+      };
+      xhr.timeout = 120000;
+      xhr.send(blob);
     };
-    xhr.onerror = () => reject(new Error('서버와 연결이 끊어졌습니다.'));
-    xhr.ontimeout = () => reject(new Error('업로드 시간이 초과되었습니다.'));
-    xhr.timeout = 120000;
-    xhr.send(blob);
+    send();
   });
 }
 
 async function uploadFileInChunks() {
-  const CHUNK_SIZE = 4 * 1024 * 1024;
+  // Smaller chunks make mobile/browser uploads much more reliable.
+  const CHUNK_SIZE = 2 * 1024 * 1024;
   const total = Math.ceil(selectedFile.size / CHUNK_SIZE);
   const level = document.querySelector('input[name="level"]:checked').value;
 

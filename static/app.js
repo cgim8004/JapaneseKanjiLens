@@ -47,11 +47,65 @@ function showError(message) {
   progress.classList.add('hidden');
 }
 
+function postJson(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(async response => {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `서버 오류 (${response.status})`);
+    return data;
+  });
+}
+
+function uploadChunk(url, blob, index, total) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Chunk-Index', String(index));
+    xhr.setRequestHeader('X-Total-Chunks', String(total));
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || `업로드 오류 (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('서버와 연결이 끊어졌습니다.'));
+    xhr.ontimeout = () => reject(new Error('업로드 시간이 초과되었습니다.'));
+    xhr.timeout = 120000;
+    xhr.send(blob);
+  });
+}
+
+async function uploadFileInChunks() {
+  const CHUNK_SIZE = 4 * 1024 * 1024;
+  const total = Math.ceil(selectedFile.size / CHUNK_SIZE);
+  const level = document.querySelector('input[name="level"]:checked').value;
+
+  const created = await postJson('/api/create-job', {
+    filename: selectedFile.name,
+    size: selectedFile.size,
+    level,
+  });
+
+  for (let index = 0; index < total; index++) {
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(selectedFile.size, start + CHUNK_SIZE);
+    await uploadChunk(`/api/upload-chunk/${created.job_id}`, selectedFile.slice(start, end), index, total);
+    const percent = Math.round((end / selectedFile.size) * 100);
+    statusText.textContent = `파일 업로드 중... ${percent}% (${index + 1}/${total})`;
+  }
+
+  return {job_id: created.job_id, status_url: `/api/status/${created.job_id}`};
+}
+
 function pollStatus(statusUrl) {
   clearTimeout(pollTimer);
   const check = async () => {
     try {
-      const response = await fetch(statusUrl, { cache: 'no-store' });
+      const response = await fetch(statusUrl, {cache: 'no-store'});
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '작업 상태를 확인할 수 없습니다.');
 
@@ -79,44 +133,20 @@ function pollStatus(statusUrl) {
   check();
 }
 
-processBtn.addEventListener('click', () => {
+processBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
   processBtn.disabled = true;
   result.classList.add('hidden');
   errorBox.classList.add('hidden');
   progress.classList.remove('hidden');
-  statusText.textContent = '파일 업로드 중... 0%';
+  statusText.textContent = '업로드 준비 중...';
 
-  const form = new FormData();
-  form.append('audio', selectedFile);
-  form.append('level', document.querySelector('input[name="level"]:checked').value);
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/process');
-  xhr.responseType = 'json';
-  xhr.upload.onprogress = event => {
-    if (event.lengthComputable) {
-      const percent = Math.round((event.loaded / event.total) * 100);
-      statusText.textContent = `파일 업로드 중... ${percent}%`;
-    }
-  };
-  xhr.onload = () => {
-    const data = xhr.response || {};
-    if (xhr.status >= 200 && xhr.status < 300 && data.job_id) {
-      statusText.textContent = '업로드 완료. 음성 복원을 시작합니다...';
-      pollStatus(data.status_url);
-      return;
-    }
-    showError(data.error || `서버 오류 (${xhr.status})`);
+  try {
+    const job = await uploadFileInChunks();
+    statusText.textContent = '업로드 완료. 음성 복원을 시작합니다...';
+    pollStatus(job.status_url);
+  } catch (error) {
+    showError(error.message || '업로드에 실패했습니다.');
     processBtn.disabled = false;
-  };
-  xhr.onerror = () => {
-    showError('서버와 연결이 끊어졌습니다. 잠시 후 다시 시도해주세요.');
-    processBtn.disabled = false;
-  };
-  xhr.ontimeout = () => {
-    showError('업로드 시간이 초과되었습니다.');
-    processBtn.disabled = false;
-  };
-  xhr.send(form);
+  }
 });

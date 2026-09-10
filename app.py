@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 import subprocess
-import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -11,7 +11,6 @@ from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-# Browser uploads are sent in small chunks.
 app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,8 +31,7 @@ def ffmpeg_path():
 
 
 def write_status(job_dir, state, message='', error=''):
-    status_path = job_dir / 'status.json'
-    status_path.write_text(
+    (job_dir / 'status.json').write_text(
         json.dumps({'state': state, 'message': message, 'error': error}, ensure_ascii=False),
         encoding='utf-8'
     )
@@ -42,56 +40,59 @@ def write_status(job_dir, state, message='', error=''):
 def process_job(job_id, level):
     job_dir = WORK_DIR / job_id
     log_path = job_dir / 'process.log'
-    input_files = [
-        p for p in job_dir.iterdir()
-        if p.is_file() and p.name not in {'status.json', 'process.log', 'lecture_cleaned.mp3', 'upload.meta'}
-    ]
-    if not input_files:
-        write_status(job_dir, 'error', error='업로드된 파일을 찾을 수 없습니다.')
-        return
-
-    input_path = input_files[0]
-    output_path = job_dir / 'lecture_cleaned.mp3'
-
     try:
-        with log_path.open('a', encoding='utf-8') as log:
-            log.write(f'worker started: {job_id}\n')
-            log.flush()
+        meta_path = job_dir / 'upload.meta'
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        input_path = job_dir / meta['filename']
+        output_path = job_dir / 'lecture_cleaned.mp3'
 
-            ffmpeg = ffmpeg_path()
-            # Keep the filter chain light enough for Render Free while targeting desk thumps
-            # and quiet speech. A high-pass removes low-frequency impacts; compression
-            # raises quieter speech relative to louder writing/desk sounds; limiter prevents clipping.
-            settings = {
-                'light': ('80', '2.0'),
-                'medium': ('100', '3.0'),
-                'strong': ('130', '4.0'),
-            }
-            highpass_hz, comp_ratio = settings.get(level, settings['medium'])
-            filters = (
-                f'highpass=f={highpass_hz}:p=2,'
-                f'acompressor=threshold=0.12:ratio={comp_ratio}:attack=20:release=300:makeup=4,'
-                'volume=1.5,'
-                'alimiter=limit=0.95:level=disabled'
-            )
+        if not input_path.exists() or input_path.stat().st_size != int(meta['size']):
+            write_status(job_dir, 'error', error='업로드된 원본 파일이 없습니다.')
+            return
 
-            cmd = [
-                ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
-                '-i', str(input_path),
-                '-vn', '-af', filters,
-                '-ar', '44100', '-ac', '1',
-                '-c:a', 'libmp3lame', '-b:a', '128k', str(output_path)
-            ]
+        settings = {
+            'light': ('80', '2.0'),
+            'medium': ('100', '3.0'),
+            'strong': ('130', '4.0'),
+        }
+        highpass_hz, comp_ratio = settings.get(level, settings['medium'])
+        filters = (
+            f'highpass=f={highpass_hz}:p=2,'
+            f'acompressor=threshold=0.12:ratio={comp_ratio}:attack=20:release=300:makeup=4,'
+            'volume=1.5,'
+            'alimiter=limit=0.95:level=disabled'
+        )
 
-            write_status(job_dir, 'processing', '음성을 복원하고 있습니다. 녹음 길이에 따라 시간이 걸릴 수 있습니다.')
+        cmd = [
+            ffmpeg_path(), '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+            '-i', str(input_path),
+            '-vn', '-af', filters,
+            '-ar', '44100', '-ac', '1',
+            '-threads', '1',
+            '-c:a', 'libmp3lame', '-b:a', '128k',
+            str(output_path)
+        ]
+
+        write_status(job_dir, 'processing', '음성을 복원하고 있습니다. 녹음 길이에 따라 시간이 걸릴 수 있습니다.')
+        with log_path.open('w', encoding='utf-8') as log:
+            log.write('worker started\n')
             log.write('running ffmpeg\n')
             log.flush()
-            completed = subprocess.run(cmd, stdout=log, stderr=log, text=True, timeout=60 * 60 * 6)
+            completed = subprocess.run(
+                cmd, stdout=log, stderr=log, text=True,
+                timeout=60 * 60 * 6, check=False
+            )
             log.write(f'ffmpeg returncode: {completed.returncode}\n')
             log.flush()
 
         if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-            detail = 'FFmpeg가 음성 파일을 만들지 못했습니다. process.log를 확인하세요.'
+            detail = '음성 변환에 실패했습니다.'
+            try:
+                log_text = log_path.read_text(encoding='utf-8').strip()
+                if log_text:
+                    detail += f' FFmpeg: {log_text[-800:]}'
+            except Exception:
+                pass
             write_status(job_dir, 'error', error=detail)
             return
 
@@ -104,6 +105,13 @@ def process_job(job_id, level):
         write_status(job_dir, 'error', error='처리 시간이 너무 오래 걸려 중단되었습니다.')
     except Exception as exc:
         write_status(job_dir, 'error', error=f'처리 중 오류가 발생했습니다: {exc}')
+
+
+def start_processing(job_id, level):
+    # Do not detach the worker from Gunicorn. Render can terminate detached
+    # children, which leaves the browser stuck in "processing" forever.
+    thread = threading.Thread(target=process_job, args=(job_id, level), daemon=True)
+    thread.start()
 
 
 @app.get('/')
@@ -154,8 +162,7 @@ def upload_chunk(job_id):
         if index < 0 or total <= 0 or index >= total:
             return jsonify(error='잘못된 업로드 조각입니다.'), 400
 
-        filename = meta['filename']
-        input_path = job_dir / filename
+        input_path = job_dir / meta['filename']
         chunk = request.get_data(cache=False)
         if not chunk:
             return jsonify(error='빈 업로드 조각입니다.'), 400
@@ -173,20 +180,7 @@ def upload_chunk(job_id):
 
             level = meta.get('level', 'medium')
             write_status(job_dir, 'queued', '업로드 완료. 음성 복원을 시작합니다.')
-            log_path = job_dir / 'process.log'
-            log_file = log_path.open('w', encoding='utf-8')
-            try:
-                subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), '--worker', job_id, level],
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            except Exception:
-                log_file.close()
-                raise
-            log_file.close()
+            start_processing(job_id, level)
             return jsonify(ok=True, complete=True, status_url=f'/api/status/{job_id}')
 
         return jsonify(ok=True, complete=False)
@@ -199,8 +193,7 @@ def upload_chunk(job_id):
 def status(job_id):
     if '/' in job_id or '\\' in job_id or not job_id.isalnum():
         return jsonify(error='잘못된 요청입니다.'), 400
-    job_dir = WORK_DIR / job_id
-    status_path = job_dir / 'status.json'
+    status_path = WORK_DIR / job_id / 'status.json'
     if not status_path.exists():
         return jsonify(error='작업을 찾을 수 없습니다.'), 404
     try:
@@ -229,7 +222,4 @@ def too_large(_):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) >= 3 and sys.argv[1] == '--worker':
-        process_job(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else 'medium')
-    else:
-        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)

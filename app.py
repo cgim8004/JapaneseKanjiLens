@@ -11,13 +11,15 @@ from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
+# Uploads are sent in small chunks so large files do not depend on one huge HTTP request.
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8 MB per chunk
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = Path(os.environ.get('WORK_DIR', BASE_DIR / 'work'))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'webm', 'mp4'}
+MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
 def allowed(filename):
@@ -39,7 +41,7 @@ def write_status(job_dir, state, message='', error=''):
 
 def process_job(job_id, level):
     job_dir = WORK_DIR / job_id
-    input_files = [p for p in job_dir.iterdir() if p.is_file() and p.name not in {'status.json', 'process.log', 'lecture_cleaned.mp3'}]
+    input_files = [p for p in job_dir.iterdir() if p.is_file() and p.name not in {'status.json', 'process.log', 'lecture_cleaned.mp3', 'upload.meta'}]
     if not input_files:
         write_status(job_dir, 'error', error='업로드된 파일을 찾을 수 없습니다.')
         return
@@ -56,7 +58,6 @@ def process_job(job_id, level):
         }
         highpass_hz, comp_ratio, denoise = settings.get(level, settings['medium'])
 
-        # Keep the filter chain reasonably light for Render's free 512 MB instance.
         filters = (
             f'highpass=f={highpass_hz}:p=2,'
             f'afftdn=nr={denoise}:nf=-40,'
@@ -95,50 +96,88 @@ def index():
     return render_template('index.html')
 
 
-@app.post('/api/process')
-def process_audio():
-    try:
-        # Resolve once here so an unavailable bundled FFmpeg is reported before upload work begins.
-        ffmpeg_path()
-    except Exception as exc:
-        return jsonify(error=f'FFmpeg를 준비하지 못했습니다: {exc}'), 500
+@app.post('/api/create-job')
+def create_job():
+    data = request.get_json(silent=True) or {}
+    filename = secure_filename(str(data.get('filename', '')))
+    level = str(data.get('level', 'medium'))
+    size = int(data.get('size', 0) or 0)
 
-    uploaded = request.files.get('audio')
-    if not uploaded or not uploaded.filename:
-        return jsonify(error='음성 파일을 선택해주세요.'), 400
-    if not allowed(uploaded.filename):
+    if not filename or not allowed(filename):
         return jsonify(error='지원하지 않는 파일 형식입니다.'), 400
+    if size <= 0:
+        return jsonify(error='파일 크기를 확인할 수 없습니다.'), 400
+    if size > MAX_FILE_SIZE:
+        return jsonify(error='파일이 너무 큽니다. 최대 100MB까지 지원합니다.'), 413
 
     job_id = uuid.uuid4().hex
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    input_path = job_dir / secure_filename(uploaded.filename)
+    (job_dir / 'upload.meta').write_text(
+        json.dumps({'filename': filename, 'size': size, 'level': level}, ensure_ascii=False),
+        encoding='utf-8'
+    )
+    (job_dir / filename).touch()
+    write_status(job_dir, 'uploading', '파일 업로드 준비 중...')
+    return jsonify(ok=True, job_id=job_id)
+
+
+@app.post('/api/upload-chunk/<job_id>')
+def upload_chunk(job_id):
+    if '/' in job_id or '\\' in job_id or not job_id.isalnum():
+        return jsonify(error='잘못된 요청입니다.'), 400
+
+    job_dir = WORK_DIR / job_id
+    meta_path = job_dir / 'upload.meta'
+    if not meta_path.exists():
+        return jsonify(error='업로드 작업을 찾을 수 없습니다.'), 404
 
     try:
-        write_status(job_dir, 'uploading', '파일을 서버에 업로드하고 있습니다.')
-        uploaded.save(input_path)
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        index = int(request.headers.get('X-Chunk-Index', '-1'))
+        total = int(request.headers.get('X-Total-Chunks', '0'))
+        if index < 0 or total <= 0 or index >= total:
+            return jsonify(error='잘못된 업로드 조각입니다.'), 400
 
-        level = request.form.get('level', 'medium')
-        write_status(job_dir, 'queued', '업로드 완료. 음성 복원을 시작합니다.')
+        filename = meta['filename']
+        input_path = job_dir / filename
+        chunk = request.get_data(cache=False)
+        if not chunk:
+            return jsonify(error='빈 업로드 조각입니다.'), 400
 
-        log_path = job_dir / 'process.log'
-        log_file = log_path.open('w', encoding='utf-8')
-        try:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), '--worker', job_id, level],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        except Exception:
+        # The browser sends chunks sequentially. Append keeps memory use low.
+        with input_path.open('ab') as f:
+            f.write(chunk)
+
+        received = input_path.stat().st_size
+        write_status(job_dir, 'uploading', f'파일 업로드 중... {min(100, round(received / meta["size"] * 100))}%')
+
+        if index == total - 1:
+            if received != meta['size']:
+                write_status(job_dir, 'error', error='파일 업로드 크기가 일치하지 않습니다.')
+                return jsonify(error='파일 업로드가 완전하지 않습니다.'), 400
+
+            level = meta.get('level', 'medium')
+            write_status(job_dir, 'queued', '업로드 완료. 음성 복원을 시작합니다.')
+            log_path = job_dir / 'process.log'
+            log_file = log_path.open('w', encoding='utf-8')
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), '--worker', job_id, level],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except Exception:
+                log_file.close()
+                raise
             log_file.close()
-            raise
-        log_file.close()
+            return jsonify(ok=True, complete=True, status_url=f'/api/status/{job_id}')
 
-        return jsonify(ok=True, job_id=job_id, status_url=f'/api/status/{job_id}')
+        return jsonify(ok=True, complete=False)
     except Exception as exc:
-        write_status(job_dir, 'error', error=f'업로드/처리 시작 중 오류가 발생했습니다: {exc}')
-        return jsonify(error=f'업로드/처리 시작 중 오류가 발생했습니다: {exc}'), 500
+        write_status(job_dir, 'error', error=f'업로드 중 오류가 발생했습니다: {exc}')
+        return jsonify(error=f'업로드 중 오류가 발생했습니다: {exc}'), 500
 
 
 @app.get('/api/status/<job_id>')
@@ -171,7 +210,7 @@ def download(job_id):
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error='파일이 너무 큽니다. 최대 100MB까지 지원합니다.'), 413
+    return jsonify(error='업로드 조각이 너무 큽니다. 다시 시도해주세요.'), 413
 
 
 if __name__ == '__main__':

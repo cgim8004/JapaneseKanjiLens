@@ -11,8 +11,8 @@ from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-# Uploads are sent in small chunks so large files do not depend on one huge HTTP request.
-app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8 MB per chunk
+# Browser uploads are sent in small chunks.
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = Path(os.environ.get('WORK_DIR', BASE_DIR / 'work'))
@@ -41,7 +41,11 @@ def write_status(job_dir, state, message='', error=''):
 
 def process_job(job_id, level):
     job_dir = WORK_DIR / job_id
-    input_files = [p for p in job_dir.iterdir() if p.is_file() and p.name not in {'status.json', 'process.log', 'lecture_cleaned.mp3', 'upload.meta'}]
+    log_path = job_dir / 'process.log'
+    input_files = [
+        p for p in job_dir.iterdir()
+        if p.is_file() and p.name not in {'status.json', 'process.log', 'lecture_cleaned.mp3', 'upload.meta'}
+    ]
     if not input_files:
         write_status(job_dir, 'error', error='업로드된 파일을 찾을 수 없습니다.')
         return
@@ -50,34 +54,45 @@ def process_job(job_id, level):
     output_path = job_dir / 'lecture_cleaned.mp3'
 
     try:
-        ffmpeg = ffmpeg_path()
-        settings = {
-            'light': ('100', '1.4', '0.65'),
-            'medium': ('130', '1.7', '0.75'),
-            'strong': ('170', '2.0', '0.85'),
-        }
-        highpass_hz, comp_ratio, denoise = settings.get(level, settings['medium'])
+        with log_path.open('a', encoding='utf-8') as log:
+            log.write(f'worker started: {job_id}\n')
+            log.flush()
 
-        filters = (
-            f'highpass=f={highpass_hz}:p=2,'
-            f'afftdn=nr={denoise}:nf=-40,'
-            f'acompressor=threshold=0.08:ratio={comp_ratio}:attack=15:release=180:makeup=2,'
-            'loudnorm=I=-16:TP=-1.5:LRA=11'
-        )
+            ffmpeg = ffmpeg_path()
+            # Keep the filter chain light enough for Render Free while targeting desk thumps
+            # and quiet speech. A high-pass removes low-frequency impacts; compression
+            # raises quieter speech relative to louder writing/desk sounds; limiter prevents clipping.
+            settings = {
+                'light': ('80', '2.0'),
+                'medium': ('100', '3.0'),
+                'strong': ('130', '4.0'),
+            }
+            highpass_hz, comp_ratio = settings.get(level, settings['medium'])
+            filters = (
+                f'highpass=f={highpass_hz}:p=2,'
+                f'acompressor=threshold=0.12:ratio={comp_ratio}:attack=20:release=300:makeup=4,'
+                'volume=1.5,'
+                'alimiter=limit=0.95:level=disabled'
+            )
 
-        cmd = [
-            ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
-            '-i', str(input_path),
-            '-vn', '-af', filters,
-            '-ar', '44100', '-ac', '1',
-            '-c:a', 'libmp3lame', '-b:a', '128k', str(output_path)
-        ]
+            cmd = [
+                ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', str(input_path),
+                '-vn', '-af', filters,
+                '-ar', '44100', '-ac', '1',
+                '-c:a', 'libmp3lame', '-b:a', '128k', str(output_path)
+            ]
 
-        write_status(job_dir, 'processing', '음성을 복원하고 있습니다. 녹음 길이에 따라 시간이 걸릴 수 있습니다.')
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60 * 6)
-        if completed.returncode != 0 or not output_path.exists():
-            detail = completed.stderr.strip()[-1200:]
-            write_status(job_dir, 'error', error=f'음성 처리에 실패했습니다. {detail}')
+            write_status(job_dir, 'processing', '음성을 복원하고 있습니다. 녹음 길이에 따라 시간이 걸릴 수 있습니다.')
+            log.write('running ffmpeg\n')
+            log.flush()
+            completed = subprocess.run(cmd, stdout=log, stderr=log, text=True, timeout=60 * 60 * 6)
+            log.write(f'ffmpeg returncode: {completed.returncode}\n')
+            log.flush()
+
+        if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+            detail = 'FFmpeg가 음성 파일을 만들지 못했습니다. process.log를 확인하세요.'
+            write_status(job_dir, 'error', error=detail)
             return
 
         try:
@@ -145,7 +160,6 @@ def upload_chunk(job_id):
         if not chunk:
             return jsonify(error='빈 업로드 조각입니다.'), 400
 
-        # The browser sends chunks sequentially. Append keeps memory use low.
         with input_path.open('ab') as f:
             f.write(chunk)
 
@@ -167,6 +181,7 @@ def upload_chunk(job_id):
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
+                    close_fds=True,
                 )
             except Exception:
                 log_file.close()
